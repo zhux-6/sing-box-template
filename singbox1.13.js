@@ -1,11 +1,15 @@
 const { name, type = "0", rules: rules_file } = $arguments;
 
+// 1. 读取模板
 let config = JSON.parse($files[0]);
 
-// 自定义规则插入（不变）
+// 2. 先追加自定义规则
 if (rules_file) {
   try {
-    let customRulesRaw = await produceArtifact({ type: "file", name: rules_file });
+    let customRulesRaw = await produceArtifact({
+      type: "file",
+      name: rules_file,
+    });
     if (customRulesRaw) {
       let customRules = JSON.parse(customRulesRaw);
       let idx = config.route.rules.findIndex(r => r.clash_mode === "global");
@@ -20,7 +24,7 @@ if (rules_file) {
   } catch (e) {}
 }
 
-// 拉取节点
+// 3. 拉取节点
 let proxies = await produceArtifact({
   name,
   type: /^1$|col/i.test(type) ? "collection" : "subscription",
@@ -28,16 +32,18 @@ let proxies = await produceArtifact({
   produceType: "internal",
 });
 
-// 节点去重
+// 4. 去重已有节点 tag
 const existingTags = config.outbounds.map(o => o.tag);
 proxies = proxies.filter(p => !existingTags.includes(p.tag));
 
+// 5. 添加新节点到 outbounds
 config.outbounds.push(...proxies);
 
+// 6. 准备 tag 列表
 const allTags = proxies.map(p => p.tag);
 const terminalTags = proxies.filter(p => !p.detour).map(p => p.tag);
 
-// ── 新增：地区关键词映射 ──────────────────────────────
+// ── 新增：地区测速组定义 ──────────────────────────────
 const regionGroups = [
   { tag: "Auto-HK", keywords: ["香港", "Hong Kong", "HK", "🇭🇰"] },
   { tag: "Auto-SG", keywords: ["新加坡", "Singapore", "SG", "🇸🇬"] },
@@ -45,36 +51,52 @@ const regionGroups = [
   { tag: "Auto-US", keywords: ["美国", "United States", "US", "USA", "🇺🇸"] },
   { tag: "Auto-JP", keywords: ["日本", "Japan", "JP", "🇯🇵"] },
 ];
+const regionTags = regionGroups.map(r => r.tag);
 
-// 按地区过滤终端节点，注入到地区 urltest 分组
+// 如果模板里没有这些地区组，则动态创建并插入到 Auto 分组之前
+regionGroups.forEach(({ tag, keywords }) => {
+  if (!config.outbounds.find(o => o.tag === tag)) {
+    const autoIdx = config.outbounds.findIndex(o => o.tag === "Auto");
+    const newGroup = {
+      tag,
+      type: "urltest",
+      outbounds: [],
+      url: "https://www.gstatic.com/generate_204",
+      interval: "3m",
+      tolerance: 50,
+    };
+    if (autoIdx !== -1) {
+      config.outbounds.splice(autoIdx, 0, newGroup);
+    } else {
+      config.outbounds.push(newGroup);
+    }
+  }
+});
+
+// 把对应地区的终端节点注入各地区测速组
 regionGroups.forEach(({ tag, keywords }) => {
   const group = config.outbounds.find(o => o.tag === tag);
-  if (!group || !Array.isArray(group.outbounds)) return;
-
+  if (!group) return;
   const matched = terminalTags.filter(t =>
     keywords.some(kw => t.includes(kw))
   );
   group.outbounds.push(...matched);
 });
 
-// 把地区组 tag 注入到 Default 分组（排在现有 outbounds 最前面）
-const defaultGroup = config.outbounds.find(o => o.tag === "Default");
-if (defaultGroup && Array.isArray(defaultGroup.outbounds)) {
-  const regionTags = regionGroups.map(r => r.tag);
-  // 只插入模板里实际存在的地区组
-  const validRegionTags = regionTags.filter(t =>
-    config.outbounds.some(o => o.tag === t)
-  );
-  defaultGroup.outbounds.unshift(...validRegionTags);
+// 将 Auto 改为 selector，outbounds 只保留五个地区组
+const autoGroup = config.outbounds.find(o => o.tag === "Auto");
+if (autoGroup) {
+  autoGroup.type = "selector";
+  autoGroup.outbounds = [...regionTags];
 }
 // ── 新增结束 ─────────────────────────────────────────
 
-// 遍历分组追加节点（原有逻辑不变）
+// 7. 遍历分组追加节点
 config.outbounds.forEach(group => {
   if (!Array.isArray(group.outbounds) || group.tag === "Direct-Out") return;
 
-  // 地区组已单独处理，跳过避免混入全部节点
-  if (regionGroups.some(r => r.tag === group.tag)) return;
+  // Auto 和地区组已单独处理，跳过
+  if (group.tag === "Auto" || regionTags.includes(group.tag)) return;
 
   if (group.tag === "Relay") {
     group.outbounds.push(...terminalTags);
@@ -83,11 +105,12 @@ config.outbounds.forEach(group => {
   }
 });
 
-// 分组内去重
+// 8. 分组内去重
 config.outbounds.forEach(group => {
   if (Array.isArray(group.outbounds)) {
     group.outbounds = [...new Set(group.outbounds)];
   }
 });
 
+// 9. 输出最终配置
 $content = JSON.stringify(config, null, 2);
